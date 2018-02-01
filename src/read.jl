@@ -127,6 +127,29 @@ function read(io::IO, T::Type{NamedTuple})
     return NamedTuple{Tuple(keys)}(Tuple(vals))
 end
 
+function read(io::IO, ::Type{T}) where {T <: NamedTuple{names, types}} where {names, types}
+    @expect '{'
+    wh!(io)
+    keys = Symbol[]
+    vals = Any[]
+    peekbyte(io) == CLOSE_CURLY_BRACE && (readbyte(io); @goto done)
+    typemap = Dict(k=>v for (k, v) in zip(names, types.parameters))
+    while true
+        key = read(io, Symbol)
+        push!(keys, key)
+        wh!(io)
+        @expect ':'
+        wh!(io)
+        push!(vals, read(io, typemap[key])) # recursively reads value
+        wh!(io)
+        @expectoneof ',' '}'
+        b == CLOSE_CURLY_BRACE && @goto done
+        wh!(io)
+    end
+    @label done
+    return NamedTuple{names}(NamedTuple{Tuple(keys)}(Tuple(vals)))
+end
+
 read(io::IO, ::Type{T}) where {T <: AbstractDict} = read(io, T())
 function read(io::IO, dict::Dict{K,V}) where {K, V}
     T = typeof(dict)
@@ -186,32 +209,8 @@ function read(io::IO, ::Type{Function})
 end
 
 # read Number, String, Nullable, Bool
-function read(io::IO, ::Type{T}) where {T <: Integer}
-    eof(io) && throw(ArgumentError("early EOF"))
-    v = zero(T)
-    b = peekbyte(io)
-    parseddigits = false
-    negative = false
-    if b == MINUS # check for leading '-' or '+'
-        negative = true
-        readbyte(io)
-        b = peekbyte(io)
-    elseif b == PLUS
-        readbyte(io)
-        b = peekbyte(io)
-    end
-    while NEG_ONE < b < TEN
-        parseddigits = true
-        b = readbyte(io)
-        v, ov_mul = Base.mul_with_overflow(v, T(10))
-        v, ov_add = Base.add_with_overflow(v, T(b - ZERO))
-        (ov_mul | ov_add) && throw(OverflowError("overflow parsing $T, parsed $v"))
-        eof(io) && break
-        b = peekbyte(io)
-    end
-    !parseddigits && throw(invalid(T, b))
-    return ifelse(negative, -v, v)
-end
+using Parsing
+read(io::IO, ::Type{T}) where {T <: Integer} = Parsing.parse(io, T)
 
 include("floatparsing.jl")
 
@@ -279,16 +278,15 @@ function generate_default_read_body(N, types, jsontypes, isnamedtuple)
         JSON2.peekbyte(io) == JSON2.CLOSE_CURLY_BRACE && (JSON2.readbyte(io); return T())
         $inner
         # in case there are extra fields, just ignore
+        curlies = 1
         while !eof(io)
-            JSON2.read(io, String)
-            JSON2.wh!(io)
-            JSON2.@expect ':'
-            JSON2.wh!(io)
-            JSON2.read(io, Any) # recursively reads value
-            JSON2.wh!(io)
-            JSON2.@expectoneof ',' '}'
-            b == JSON2.CLOSE_CURLY_BRACE && return $ret
-            JSON2.wh!(io)
+            b = readbyte(io)
+            if b == JSON2.OPEN_CURLY_BRACE
+                curlies += 1
+            elseif b == JSON2.CLOSE_CURLY_BRACE
+                curlies -= 1
+            end
+            curlies == 0 && return $ret
         end
         throw(ArgumentError("failed to parse $T from JSON"))
     end
@@ -329,6 +327,17 @@ function read_args(io, b, name, names, T, types, jT, jsontypes, defaults, fullty
         end
     end
     JSON2.wh!(io)
+    if b == JSON2.CLOSE_CURLY_BRACE
+        if isempty(names)
+            return ((args..., defaults[name]), b)
+        else
+            return JSON2.read_args(io, b, names[1], Base.tail(names),
+                                   types[1], Base.tail(types),
+                                   jsontypes[1], Base.tail(jsontypes),
+                                   defaults, fulltypes, fulljsontypes,
+                                   (args..., defaults[name]), argnm, arg)
+        end
+    end
     key = JSON2.read(io, Symbol)
     JSON2.wh!(io)
     JSON2.@expect ':'
@@ -371,19 +380,17 @@ function generate_missing_read_body(names, types, jsontypes, defaults)
             $(types[1]), $(Base.tail(types)),
             $(jsontypes[1]), $(Base.tail(jsontypes)),
             $defaults, $fulltypes, $fulljsontypes)
-        # @show args, b
         b == JSON2.CLOSE_CURLY_BRACE && return T(args...)
         # in case there are extra fields, just ignore
+        curlies = 1
         while !eof(io)
-            JSON2.wh!(io)
-            JSON2.read(io, String)
-            JSON2.wh!(io)
-            JSON2.@expect ':'
-            JSON2.wh!(io)
-            JSON2.read(io, Any) # recursively reads value
-            JSON2.wh!(io)
-            JSON2.@expectoneof ',' '}'
-            b == JSON2.CLOSE_CURLY_BRACE && return T(args...)
+            b = readbyte(io)
+            if b == JSON2.OPEN_CURLY_BRACE
+                curlies += 1
+            elseif b == JSON2.CLOSE_CURLY_BRACE
+                curlies -= 1
+            end
+            curlies == 0 && return $ret
         end
         throw(ArgumentError("failed to parse $T from JSON"))
     end
